@@ -64,6 +64,11 @@ pub fn run() {
         .register_asynchronous_uri_scheme_protocol("picselect-asset", |context, request, responder| {
             let app_handle = context.app_handle().clone();
             let request_uri = request.uri().clone();
+            let range_header = request.headers()
+                .get("range")
+                .or_else(|| request.headers().get("Range"))
+                .and_then(|v| v.to_str().ok())
+                .map(|s| s.to_string());
             
             std::thread::spawn(move || {
                 let state = app_handle.state::<AppState>();
@@ -210,30 +215,92 @@ pub fn run() {
                     };
                     
                     // Check L2 cache
-                    if let Some(bytes) = state.cache.get_l2(&decoded_path) {
+                    let bytes = if let Some(bytes) = state.cache.get_l2(&decoded_path) {
                         println!("[picselect-asset] L2 HIT for path {}", decoded_path);
+                        bytes
+                    } else {
+                        // Read file
+                        println!("[picselect-asset] L2 MISS for path {}", decoded_path);
+                        if let Ok(file_bytes) = fs::read(&file_path) {
+                            let shared_bytes = Arc::new(file_bytes);
+                            state.cache.insert_l2(decoded_path, shared_bytes.clone());
+                            shared_bytes
+                        } else {
+                            responder.respond(
+                                tauri::http::Response::builder()
+                                    .status(500)
+                                    .body(Vec::new())
+                                    .unwrap()
+                            );
+                            return;
+                        }
+                    };
+
+                    let file_len = bytes.len();
+                    
+                    // Support Range HTTP Requests for streaming
+                    let mut parsed_range = None;
+                    if let Some(ref range_str) = range_header {
+                        if range_str.starts_with("bytes=") {
+                            let range_parts: Vec<&str> = range_str["bytes=".len()..].split('-').collect();
+                            if range_parts.len() == 2 {
+                                let start_str = range_parts[0].trim();
+                                let end_str = range_parts[1].trim();
+                                
+                                if !start_str.is_empty() || !end_str.is_empty() {
+                                    if start_str.is_empty() {
+                                        if let Ok(suffix_len) = end_str.parse::<usize>() {
+                                            let start = if file_len > suffix_len { file_len - suffix_len } else { 0 };
+                                            parsed_range = Some((start, file_len - 1));
+                                        }
+                                    } else if end_str.is_empty() {
+                                        if let Ok(start) = start_str.parse::<usize>() {
+                                            if start < file_len {
+                                                parsed_range = Some((start, file_len - 1));
+                                            }
+                                        }
+                                    } else {
+                                        if let (Ok(start), Ok(mut end)) = (start_str.parse::<usize>(), end_str.parse::<usize>()) {
+                                            if start < file_len {
+                                                if end >= file_len {
+                                                    end = file_len - 1;
+                                                }
+                                                if start <= end {
+                                                    parsed_range = Some((start, end));
+                                                }
+                                            }
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                    
+                    if let Some((start, end)) = parsed_range {
+                        let chunk = bytes[start..=end].to_vec();
+                        let content_range = format!("bytes {}-{}/{}", start, end, file_len);
                         responder.respond(
                             tauri::http::Response::builder()
+                                .status(206)
                                 .header("Content-Type", mime_type)
+                                .header("Accept-Ranges", "bytes")
+                                .header("Content-Range", content_range)
+                                .header("Content-Length", chunk.len().to_string())
+                                .body(chunk)
+                                .unwrap()
+                        );
+                    } else {
+                        responder.respond(
+                            tauri::http::Response::builder()
+                                .status(200)
+                                .header("Content-Type", mime_type)
+                                .header("Accept-Ranges", "bytes")
+                                .header("Content-Length", file_len.to_string())
                                 .body(bytes.as_ref().clone())
                                 .unwrap()
                         );
-                        return;
                     }
-                    
-                    // Read file
-                    println!("[picselect-asset] L2 MISS for path {}", decoded_path);
-                    if let Ok(bytes) = fs::read(&file_path) {
-                        let shared_bytes = Arc::new(bytes);
-                        state.cache.insert_l2(decoded_path, shared_bytes.clone());
-                        responder.respond(
-                            tauri::http::Response::builder()
-                                .header("Content-Type", mime_type)
-                                .body(shared_bytes.as_ref().clone())
-                                .unwrap()
-                        );
-                        return;
-                    }
+                    return;
                 }
                 
                 // Final error fallback
