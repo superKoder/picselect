@@ -401,8 +401,8 @@ function renderEmptyState() {
 async function triggerLookahead() {
   if (mediaItems.length === 0) return;
   
-  // Determine next 5 media items to pre-buffer
-  const lookaheadWindowSize = 5;
+  // Determine next 10 media items to pre-buffer
+  const lookaheadWindowSize = 10;
   const lookaheadItems = [];
   const lookaheadIds = [];
   

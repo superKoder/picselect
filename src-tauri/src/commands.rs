@@ -147,24 +147,39 @@ pub async fn set_active_lookahead(
         .clone();
     
     // 2. Spawn preloading tasks for items in lookahead list in background thread pool
-    // 2. Spawn preloading tasks for items in lookahead list in background thread pool
     for item in active_media_items {
         if !lookahead_media_ids.contains(&item.id) {
             continue;
         }
         
-        // Skip if already in memory cache
+        // Skip if already in memory cache (both image and video components if present)
+        let mut needs_preload = false;
+        
         if let Some(ref img_path_str) = item.image_path {
             let ext = Path::new(img_path_str).extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
             if ext == "heic" {
-                if state.cache.get_l1(&item.id).is_some() {
-                    continue;
+                if state.cache.get_l1(&item.id).is_none() {
+                    needs_preload = true;
                 }
             } else {
-                if state.cache.get_l2(img_path_str).is_some() {
-                    continue;
+                if state.cache.get_l2(img_path_str).is_none() {
+                    needs_preload = true;
                 }
             }
+        }
+        
+        if let Some(ref vid_path_str) = item.video_path {
+            if state.cache.get_l2(vid_path_str).is_none() {
+                if let Ok(metadata) = fs::metadata(vid_path_str) {
+                    if metadata.len() < 50 * 1024 * 1024 { // Under 50 MiB
+                        needs_preload = true;
+                    }
+                }
+            }
+        }
+        
+        if !needs_preload {
+            continue;
         }
         
         // Skip if a preloading task is already active for this item
@@ -180,6 +195,7 @@ pub async fn set_active_lookahead(
         
         // Spawn background task
         let handle = tokio::spawn(async move {
+            // 1. Preload Image if present
             if let Some(ref img_path_str) = item_clone.image_path {
                 let img_path = PathBuf::from(img_path_str);
                 let ext = img_path.extension().and_then(|s| s.to_str()).unwrap_or("").to_lowercase();
@@ -189,61 +205,68 @@ pub async fn set_active_lookahead(
                     #[cfg(target_os = "macos")]
                     {
                         // On macOS, WebKit natively handles HEIC hardware-accelerated. Just pre-read to L2!
-                        if cache.get_l2(img_path_str).is_some() {
-                            cache_clone.loading_tasks.lock().unwrap().remove(&media_id_clone);
-                            return;
-                        }
-                        if let Ok(bytes) = fs::read(&img_path) {
-                            cache.insert_l2(img_path_str.clone(), Arc::new(bytes));
+                        if cache.get_l2(img_path_str).is_none() {
+                            if let Ok(bytes) = fs::read(&img_path) {
+                                cache.insert_l2(img_path_str.clone(), Arc::new(bytes));
+                            }
                         }
                     }
                     
                     #[cfg(not(target_os = "macos"))]
                     {
-                        if cache.get_l1(&item_clone.id).is_some() {
-                            cache_clone.loading_tasks.lock().unwrap().remove(&media_id_clone);
-                            return; // Already in L1 cache
+                        if cache.get_l1(&item_clone.id).is_none() {
+                            // Pre-read into L2 if needed
+                            let file_bytes = match cache.get_l2(img_path_str) {
+                                Some(bytes) => bytes,
+                                None => {
+                                    if let Ok(bytes) = fs::read(&img_path) {
+                                        let shared_bytes = Arc::new(bytes);
+                                        cache.insert_l2(img_path_str.clone(), shared_bytes.clone());
+                                        shared_bytes
+                                    } else {
+                                        Arc::new(Vec::new())
+                                    }
+                                }
+                            };
+                            
+                            if !file_bytes.is_empty() {
+                                let media_id = item_clone.id.clone();
+                                let _ = tokio::task::spawn_blocking(move || {
+                                    if let Ok(decoded) = CacheManager::decode_heic_to_rgba(&file_bytes) {
+                                        let mut jpeg_bytes = Vec::new();
+                                        let rgb: Vec<u8> = decoded.rgba
+                                            .chunks_exact(4)
+                                            .flat_map(|rgba| [rgba[0], rgba[1], rgba[2]])
+                                            .collect();
+                                        let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut jpeg_bytes);
+                                        if encoder.encode(&rgb, decoded.width, decoded.height, image::ColorType::Rgb8.into()).is_ok() {
+                                            cache.insert_l1(media_id, Arc::new(jpeg_bytes));
+                                        }
+                                    }
+                                }).await;
+                            }
                         }
-                        
-                        // Pre-read into L2 if needed
-                        let file_bytes = match cache.get_l2(img_path_str) {
-                            Some(bytes) => bytes,
-                            None => {
-                                if let Ok(bytes) = fs::read(&img_path) {
-                                    let shared_bytes = Arc::new(bytes);
-                                    cache.insert_l2(img_path_str.clone(), shared_bytes.clone());
-                                    shared_bytes
-                                } else {
-                                    cache_clone.loading_tasks.lock().unwrap().remove(&media_id_clone);
-                                    return;
-                                }
-                            }
-                        };
-                        
-                        // Pre-decode and pre-encode HEIC to JPEG in L1 in the background thread
-                        let media_id = item_clone.id.clone();
-                        let _ = tokio::task::spawn_blocking(move || {
-                            if let Ok(decoded) = CacheManager::decode_heic_to_rgba(&file_bytes) {
-                                let mut jpeg_bytes = Vec::new();
-                                let rgb: Vec<u8> = decoded.rgba
-                                    .chunks_exact(4)
-                                    .flat_map(|rgba| [rgba[0], rgba[1], rgba[2]])
-                                    .collect();
-                                let mut encoder = image::codecs::jpeg::JpegEncoder::new(&mut jpeg_bytes);
-                                if encoder.encode(&rgb, decoded.width, decoded.height, image::ColorType::Rgb8.into()).is_ok() {
-                                    cache.insert_l1(media_id, Arc::new(jpeg_bytes));
-                                }
-                            }
-                        }).await;
                     }
                 } else if ext == "jpg" || ext == "jpeg" || ext == "png" {
                     // Standard image: just pre-read into L2 cache
-                    if cache.get_l2(img_path_str).is_some() {
-                        cache_clone.loading_tasks.lock().unwrap().remove(&media_id_clone);
-                        return;
+                    if cache.get_l2(img_path_str).is_none() {
+                        if let Ok(bytes) = fs::read(&img_path) {
+                            cache.insert_l2(img_path_str.clone(), Arc::new(bytes));
+                        }
                     }
-                    if let Ok(bytes) = fs::read(&img_path) {
-                        cache.insert_l2(img_path_str.clone(), Arc::new(bytes));
+                }
+            }
+            
+            // 2. Preload Video if present
+            if let Some(ref vid_path_str) = item_clone.video_path {
+                if cache.get_l2(vid_path_str).is_none() {
+                    let vid_path = PathBuf::from(vid_path_str);
+                    if let Ok(metadata) = fs::metadata(&vid_path) {
+                        if metadata.len() < 50 * 1024 * 1024 { // Under 50 MiB
+                            if let Ok(bytes) = fs::read(&vid_path) {
+                                cache.insert_l2(vid_path_str.clone(), Arc::new(bytes));
+                            }
+                        }
                     }
                 }
             }
